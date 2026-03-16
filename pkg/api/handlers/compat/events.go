@@ -5,6 +5,7 @@ package compat
 import (
 	"fmt"
 	"net/http"
+	"sync"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/sirupsen/logrus"
@@ -15,6 +16,11 @@ import (
 	api "go.podman.io/podman/v6/pkg/api/types"
 	"go.podman.io/podman/v6/pkg/domain/entities"
 	"go.podman.io/podman/v6/pkg/util"
+)
+
+var (
+	previousHealthStatus = make(map[string]string)
+	healthStatusLock     sync.Mutex
 )
 
 // GetEvents endpoint serves both the docker-compatible one and the new libpod one
@@ -105,6 +111,32 @@ func GetEvents(w http.ResponseWriter, r *http.Request) {
 				e.Status = "die" //nolint:staticcheck // deprecated field
 				e.Action = "die"
 				e.Actor.Attributes["exitCode"] = e.Actor.Attributes["containerExitCode"]
+			}
+
+			if !utils.IsLibpodRequest(r) && e.Action == "health_status" {
+				containerID := e.Actor.ID
+				currentStatus := e.HealthStatus
+
+				healthStatusLock.Lock()
+				previousStatus, exists := previousHealthStatus[containerID]
+				unchanged := previousStatus == currentStatus
+				logrus.Debugf("compat/events.go: GetEvents CID=%s previStatus=%s currStatus=%s exists=%t unchanged=%t" , e.Actor.ID, previousStatus, currentStatus, exists, unchanged)
+				if exists && unchanged {
+					healthStatusLock.Unlock()
+					continue
+				}
+				previousHealthStatus[containerID] = currentStatus
+				healthStatusLock.Unlock()
+
+				switch currentStatus {
+				case "healthy":
+					e.Action = "health_status: healthy"
+				case "unhealthy":
+					e.Action = "health_status: unhealthy"
+				default:
+					e.Action = "health_status: running"
+				}
+
 			}
 
 			// Remove fields which are not set in 1.52 and newer.
